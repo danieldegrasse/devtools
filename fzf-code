@@ -1,0 +1,4 @@
+#!/bin/bash
+
+# Run FZF, and open the output in vscode
+code -r $(fd . $1 | fzf)

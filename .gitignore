@@ -1,0 +1,4 @@
+# Ignore tooling that is not going to be sent to github
+private
+
+*.swp
