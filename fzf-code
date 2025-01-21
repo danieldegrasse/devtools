@@ -1,4 +1,7 @@
 #!/bin/bash
 
 # Run FZF, and open the output in vscode
-code -r $(fd . $1 | fzf)
+file=$(fd . $1 | fzf)
+if [ -n "${file}" ]; then
+	code -r $file
+fi
