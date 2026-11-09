@@ -1,31 +1,110 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env python3
 
 # Based on https://daisy.wtf/writing/github-changes-since-last-review
+# Rewritten in python because we want to get outputs of each commit,
+# even those that were added or removed.
 
-if [ $# -ne 1 ]; then
-	echo "Usage: $(basename $0) <PR number>"
-	exit 1
-fi
+import subprocess
+import argparse
+import sys
+import re
+import pydoc
 
-# Use the GitHub API to get the references we need
-PR_NUMBER=$1
-MY_USER_ID=$(gh api "/user" -q '.id')
-PR_HEAD_SHA=$(gh api "/repos/{owner}/{repo}/pulls/$PR_NUMBER" -q '.head.sha')
-PR_LAST_REVIEW_SHA=$(gh api "/repos/{owner}/{repo}/pulls/$PR_NUMBER/reviews" \
-                     -q "map(select(.user.id == $MY_USER_ID) | .commit_id)[-1]")
+def run_cmd(cmd):
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        print(f"Failed to run command: {' '.join(cmd)}")
+        sys.exit(1)
+    return result.stdout.strip()
 
-echo "Head SHA: $PR_HEAD_SHA"
-echo "Last Review: $PR_LAST_REVIEW_SHA"
+def parse_args():
+    parser = argparse.ArgumentParser(description="Get the diff of a GitHub PR since last review")
+    parser.add_argument("pr_number", help="Pull request number")
+    parser.add_argument("--origin", help="Git remote origin", default="origin")
+    parser.add_argument("--base", help="Base branch or commit SHA", default="main")
+    parser.add_argument("--creation-factor", default=60, type=int,
+                        help="Factor to determine creation/deletion fudge factor "
+                            "raise to make git more likely to match commits")
+    return parser.parse_args()
 
-# Fetch the commits we want to compare, unless we already have
-if \
-    test $(git cat-file -t $PR_LAST_REVIEW_SHA || echo 'none') != commit \
-    -o $(git cat-file -t $PR_HEAD_SHA || echo 'none') != commit
-then
-    echo "Fetching commits from upstream"
-    git fetch origin $PR_LAST_REVIEW_SHA $PR_HEAD_SHA
-fi
+def main():
+    args = parse_args()
+    pr_number = args.pr_number
 
-# Compare the ranges
-git range-diff main $PR_LAST_REVIEW_SHA $PR_HEAD_SHA
+    # Get user id using GH API
+    user_id = run_cmd(["gh", "api", "user", "--jq", ".id"])
+    # Retrieve the head SHA of the PR in latest push
+    pr_head_sha = run_cmd(["gh", "api", f"repos/:owner/:repo/pulls/{pr_number}", "-q", ".head.sha"])
+    # Get sha of PR in last review
+    pr_review_sha = run_cmd(["gh", "api", f"repos/:owner/:repo/pulls/{pr_number}/reviews",
+        "-q", f"map(select(.user.id == {user_id}) | .commit_id)[-1]"])
+
+    print(f"PR head SHA: {pr_head_sha}")
+    print(f"PR review SHA: {pr_review_sha}")
+
+    # Fetch the PR head and review SHAs
+    if subprocess.run(["git", "cat-file", "-t", pr_head_sha], capture_output=True).returncode != 0:
+        run_cmd(["git", "fetch", args.origin, pr_head_sha])
+    if subprocess.run(["git", "cat-file", "-t", pr_review_sha], capture_output=True).returncode != 0:
+        run_cmd(["git", "fetch", args.origin, pr_review_sha])
+
+    # Run git diff-range to find changes between the base and head SHAs
+    diff = run_cmd(["git", "range-diff", "--creation-factor", str(args.creation_factor),
+        "--no-patch", "--color", args.base, pr_review_sha, pr_head_sha])
+
+    ansi_escape = re.compile(r'(?:\x1B[@-Z\\-_]|[\x80-\x9A\x9C-\x9F]|(?:\x1B\[|\x9B)[0-?]*[ -/]*[@-~])')
+    diff_escaped = ansi_escape.sub('', diff)
+
+    # NOTE: range-diff output is explcitly considered unstable, so this parsing
+    # might break with a new version of git
+    changed_commits = re.findall(r"\d+:\s+([a-f\d]+)\s+!\s+\d+:\s+([a-f\d]+)\s+(.*)", diff_escaped)
+    dropped_commits = re.findall(r"\d+:\s+([a-f\d]+)\s+<\s+-:\s+-+\s+(.*)", diff_escaped)
+    added_commits = re.findall(r"-:\s+-+\s+>\s+\d+:\s+([a-f\d]+)\s+(.*)", diff_escaped)
+    equal_commits = re.findall(r"\d+:\s+([a-f\d]+)\s+=\s+\d+:\s+([a-f\d]+)\s+(.*)", diff_escaped)
+
+    commit_count = len(changed_commits) + len(dropped_commits) + len(added_commits) + len(equal_commits)
+    if commit_count != len(diff_escaped.splitlines()):
+        print("Error: Commit count does not match number of lines in diff, check range-diff output and regex")
+        sys.exit(1)
+
+    print("Summary:")
+    print(diff)
+
+    for commit in dropped_commits:
+        output = f"Dropped commit: {commit[0]} - {commit[1]}"
+        print(output)
+        sel = input("Show diff? (y/n/q): ")
+        if sel.lower() == "y":
+            pydoc.pager(output + "\n\n" + run_cmd(["git", "show", "--color", commit[0]]))
+        elif sel.lower() == "q":
+            sys.exit(0)
+
+    for commit in added_commits:
+        output = f"Added commit: {commit[0]} - {commit[1]}"
+        print(output)
+        sel = input("Show diff? (y/n/q): ")
+        if sel.lower() == "y":
+            pydoc.pager(output + "\n\n" + run_cmd(["git", "show", "--color", commit[0]]))
+        elif sel.lower() == "q":
+            sys.exit(0)
+
+    for commit in changed_commits:
+        output = f"Changed commit: {commit[0]} -> {commit[1]} - {commit[2]}"
+        print(output)
+        sel = input("Show diff? (y/n/q): ")
+        if sel.lower() == "y":
+            pydoc.pager(output + "\n\n" + run_cmd(["git", "range-diff", "--color", "--creation-factor", str(args.creation_factor),
+                f"{commit[0]}~..{commit[0]}", f"{commit[1]}~..{commit[1]}"]))
+        elif sel.lower() == "q":
+            sys.exit(0)
+
+    for commit in equal_commits:
+        print(f"Commit {commit[0]} = {commit[1]} - {commit[2]}")
+
+
+if __name__ == "__main__":
+    main()
